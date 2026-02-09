@@ -1,0 +1,15 @@
+# Jetson aarch64 CUDA wheel (reference only — installed manually in Dockerfile)
+# https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl
+
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+
+# ML / HuggingFace
+transformers>=4.57.3
+huggingface_hub>=0.21.4
+accelerate
+sentencepiece
+tqdm
+pillow
