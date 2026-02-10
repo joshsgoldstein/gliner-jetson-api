@@ -71,6 +71,12 @@ Response:
 | `MODEL_ID` | `fastino/gliner2-large-v1` | HuggingFace model ID |
 | `MODEL_DIR` | `./models` | Local model storage directory |
 | `MODEL_PRELOAD` | `1` | Set to `0` to defer model loading until first request |
+| `MAX_CONCURRENT_INFERENCES` | `1` | Maximum in-flight inference tasks across endpoints |
+| `INFERENCE_ACQUIRE_TIMEOUT_SECONDS` | `10` | Time to wait for an inference slot before returning busy |
+| `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request inference timeout |
+| `MAX_TEXT_CHARS` | `20000` | Maximum accepted `text` length |
+| `MAX_LABELS` | `256` | Maximum labels for list/dict label payloads |
+| `MAX_SCHEMA_FIELDS` | `256` | Maximum schema fields for structured payloads |
 
 ## Concurrency
 
@@ -78,11 +84,22 @@ Inference endpoints use `asyncio.to_thread()` to run model inference off the
 main event loop. This keeps the server responsive to health checks and new
 connections while a request is being processed.
 
-However, the model itself is **not thread-safe for concurrent GPU inference** —
-requests are effectively serialized through the GIL and CUDA stream ordering.
-For production workloads requiring true parallel inference, consider running
-multiple uvicorn workers (each with its own model copy) or using a dedicated
-inference server like Triton.
+To keep behavior stable under load, the API now includes:
+
+- lock-protected model initialization (prevents duplicate first-load races)
+- bounded inference concurrency with a semaphore
+- request timeouts for long-running inference calls
+- payload size/shape limits for text, labels, and schema fields
+
+Status behavior under load or oversized payloads:
+
+- `413` when `text` exceeds `MAX_TEXT_CHARS`
+- `503` when no inference slot is available within `INFERENCE_ACQUIRE_TIMEOUT_SECONDS`
+- `504` when inference exceeds `REQUEST_TIMEOUT_SECONDS`
+
+For higher throughput, tune `MAX_CONCURRENT_INFERENCES` carefully for your
+Jetson memory budget, or scale with multiple workers (each worker keeps its own
+model copy).
 
 ## Jetson Notes
 

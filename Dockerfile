@@ -51,8 +51,17 @@ RUN pip3 install --no-cache-dir gliner --no-deps \
 
 # Patch gliner package to lazy-load GLiNER from .model so importing `gliner`
 # for shared modules (used by gliner2) doesn't hard-require onnxruntime.
-RUN cat > /usr/local/lib/python3.10/dist-packages/gliner/__init__.py <<'PY'
-__version__ = "0.2.24"
+RUN python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("gliner")
+if spec is None or spec.origin is None:
+    raise RuntimeError("Could not locate installed 'gliner' package for patching")
+
+init_path = Path(spec.origin).resolve()
+init_path.write_text(
+    """__version__ = "0.2.24"
 
 from .config import GLiNERConfig
 from .infer_packing import (
@@ -79,6 +88,10 @@ __all__ = [
     "pack_requests",
     "unpack_spans",
 ]
+""",
+    encoding="utf-8",
+)
+print(f"Patched {init_path}")
 PY
 
 # Re-pin Jetson CUDA torch wheel and numpy<2 LAST — earlier pip installs
@@ -93,6 +106,15 @@ RUN --mount=type=cache,target=/var/cache/jetson-wheels \
       pip3 install --no-cache-dir --force-reinstall --no-deps "$WHEEL_PATH"; \
     fi \
     && pip3 install --no-cache-dir "numpy<2"
+
+# Sanity check: GLiNER2 import should work without ONNX Runtime installed.
+RUN python3 - <<'PY'
+import importlib.util
+import gliner2
+
+assert importlib.util.find_spec("onnxruntime") is None, "onnxruntime unexpectedly installed"
+print("gliner2 import OK, onnxruntime absent")
+PY
 
 # Copy application code
 COPY gliner-api/app.py /app/app.py

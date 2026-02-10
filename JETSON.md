@@ -1,120 +1,133 @@
 # Jetson Build Notes
 
-Building for NVIDIA Jetson (aarch64) requires careful dependency management
-because standard PyPI wheels are compiled for x86_64 and won't work. This
-document explains every Jetson-specific step in the Dockerfile and why it's
-necessary.
+This project runs GLiNER2 on NVIDIA Jetson (aarch64) with Docker.
 
-## Base Image: `dustynv/l4t-pytorch:r36.2.0`
+These notes document **exactly** what was required to get a stable container
+on JetPack 6, and why each choice exists.
 
-This is a community Jetson image from the
-[jetson-containers](https://github.com/dusty-nv/jetson-containers) project.
-It ships with CUDA, Python 3.10, and an older PyTorch pre-installed. We use it
-as a starting point because it has the correct NVIDIA driver integration for
-Jetson, but we replace most of the ML packages it bundles.
+## Final Base Image
 
-> **Future improvement:** Switch to `nvcr.io/nvidia/l4t-jetpack:r36.4.0` — a
-> leaner NVIDIA base image with CUDA + cuDNN but no pre-installed Python ML
-> packages. This would eliminate most of the cleanup steps below.
+`nvcr.io/nvidia/l4t-jetpack:r36.4.0`
 
-## cuDNN 9 (`libcudnn9-cuda-12`)
+Why:
+- Includes CUDA 12.6 + cuDNN 9 already
+- Matches JetPack/L4T runtime better than older community images
+- Avoids most manual CUDA/cuDNN patching
 
-The base image ships with cuDNN **8**, but PyTorch 2.8.0 (built for CUDA 12.6)
-requires cuDNN **9**. The NVIDIA CUDA apt repository is added manually to install
-`libcudnn9-cuda-12` since the base image doesn't include this repo.
+We moved away from `dustynv/l4t-pytorch:r36.2.0` because of repeated CUDA/cuDNN
+and binary mismatch issues.
 
-## PyTorch: Jetson aarch64 CUDA Wheel
+## Python and System Packages
 
-```dockerfile
-RUN pip3 install --no-cache-dir --no-deps \
-      "https://pypi.jetson-ai-lab.io/jp6/cu126/.../torch-2.8.0-cp310-cp310-linux_aarch64.whl"
-```
+Installed in Dockerfile:
+- `python3-pip`
+- `git`
+- `libsndfile1`
+- `libopenblas0`
+- `tini`
+- `curl`
 
-Standard `pip install torch` pulls an **x86_64 CPU-only** wheel from PyPI, which
-won't use the Jetson's GPU. Instead we install NVIDIA's official aarch64 CUDA
-wheel from [pypi.jetson-ai-lab.io](https://pypi.jetson-ai-lab.io). The `--no-deps`
-flag prevents pip from pulling in transitive dependencies that could conflict
-with the Jetson environment.
+Why:
+- `libsndfile1`: required by transitive audio deps (`soundfile`) that appear in HF/ML stacks
+- `libopenblas0`: required by PyTorch at import time even when running GPU inference
+- `tini`: proper PID 1 signal handling (`docker stop` works cleanly)
+- `curl`: used for robust wheel downloads with retry
 
-**This wheel is installed twice** — once early (so other packages can detect
-torch during install) and once at the very end with `--force-reinstall`. This
-is because intermediate `pip install` commands (e.g. `transformers`, `accelerate`)
-will silently pull in a CPU-only PyTorch from PyPI as a dependency, overwriting
-the Jetson CUDA wheel. Re-pinning it last ensures the final image has the
-correct GPU-enabled PyTorch.
+## Jetson-Specific Wheels (Critical)
 
-## ONNX Runtime: Jetson GPU Wheel
+Use NVIDIA Jetson wheel index for aarch64 CUDA builds:
+- Torch: `torch-2.8.0-cp310-cp310-linux_aarch64.whl` (cu126)
 
-```dockerfile
-RUN pip3 install --no-cache-dir \
-      "https://pypi.jetson-ai-lab.io/jp6/cu126/.../onnxruntime_gpu-1.23.0-cp310-cp310-linux_aarch64.whl"
-```
+Why:
+- Default PyPI resolution can install wrong/CPU variants or incompatible binaries
+- We explicitly pin known-good Jetson wheels
 
-Same situation as PyTorch — the standard `onnxruntime` or `onnxruntime-gpu` from
-PyPI is x86_64-only. NVIDIA provides aarch64 GPU wheels for Jetson at
-[pypi.jetson-ai-lab.io](https://pypi.jetson-ai-lab.io). We also explicitly
-uninstall any CPU `onnxruntime` that may have been pulled in by dependencies.
+## BuildKit Wheel Cache + Retry
 
-## GLiNER / GLiNER2: `--no-deps`
+Large wheel downloads from `pypi.jetson-ai-lab.io` were flaky/timeouting.
 
-```dockerfile
-RUN pip3 install --no-cache-dir gliner --no-deps \
-    && pip3 install --no-cache-dir gliner2 --no-deps
-```
+What we do:
+- Use `# syntax=docker/dockerfile:1.7`
+- Use `RUN --mount=type=cache,target=/var/cache/jetson-wheels`
+- Download via `curl --retry ...`
+- Install from cached wheel path
+- If cached wheel is corrupt, auto-delete and re-download
 
-`gliner` and `gliner2` are installed with `--no-deps` because their declared
-dependencies include `torch`, `transformers`, etc. Letting pip resolve these
-would pull in x86_64 CPU-only wheels from PyPI, overwriting the Jetson-specific
-wheels we already installed. All actual dependencies are installed separately
-with the correct Jetson-compatible versions.
+Why:
+- Faster rebuilds
+- Survives transient network issues
+- Avoids broken cache poisoning
 
-## Removing torchvision / torchaudio
+## Layer Ordering for Cache Stability
 
-```dockerfile
-RUN pip3 uninstall -y torchvision torchaudio || true
-```
+Torch wheel install is intentionally placed **before** copying `requirements.txt`.
 
-The base image bundles `torchvision` and `torchaudio` compiled for the
-**older** PyTorch that shipped with it. After we upgrade PyTorch to 2.8.0,
-these become incompatible — their C++ operators don't match the new PyTorch ABI.
-When `transformers` tries to import `torchvision` (via its image processing
-utils), it crashes with `RuntimeError: operator torchvision::nms does not exist`.
-GLiNER2 doesn't need either package, so removing them is the cleanest fix.
+Why:
+- Editing Python requirements should not invalidate the expensive torch wheel layer
 
-## `libsndfile1`
+## NumPy Pinning
 
-The base image includes Python audio packages (`soundfile`, `librosa`) as
-leftover transitive dependencies. These require the `libsndfile` system library
-at runtime. Rather than uninstalling the Python packages (which may break other
-things), we install the missing system lib.
+Pin `numpy<2` (in requirements and repinned at the end of Dockerfile).
 
-## `tini` (init process)
+Why:
+- Torch/Jetson native modules compiled against NumPy 1.x ABI
+- NumPy 2.x causes runtime warnings/errors and potential instability
 
-Python running as PID 1 inside a container doesn't handle `SIGTERM` properly —
-it ignores the signal, so `docker stop` has to wait 10 seconds then `SIGKILL`
-the process. `tini` runs as PID 1 instead and properly forwards signals to
-uvicorn, enabling graceful shutdown.
+## `gliner` / `gliner2` Installation Strategy
 
-## `numpy < 2`
+Install with `--no-deps`:
+- `pip install gliner --no-deps`
+- `pip install gliner2 --no-deps`
 
-NumPy 2.x introduced breaking ABI changes. Many packages in the Jetson
-ecosystem (PyTorch, ONNX Runtime, transformers) are compiled against NumPy 1.x.
-Pinning `numpy < 2` prevents silent segfaults from ABI mismatches.
+Why:
+- Prevents pip from overriding pinned Jetson torch with incompatible resolver outcomes
 
-## `MODEL_PRELOAD=0`
+## ONNX Runtime Decision (Important)
 
-On Jetson, loading the model during uvicorn's startup event can trigger
-`malloc(): invalid size (unsorted)` crashes. Setting `MODEL_PRELOAD=0` defers
-model loading until the first API request, after uvicorn is fully initialized.
-The first request will be slow (model load), but subsequent requests are fast.
+Current image removes ONNX Runtime packages:
+- `pip uninstall -y onnxruntime onnxruntime-gpu`
 
-## `--loop asyncio` (uvicorn)
+Why:
+- In this container stack, ONNX Runtime caused native crashes (`free(): invalid pointer`) after inference
+- `gliner` imports ONNX modules eagerly, so we patched import behavior (next section)
 
-Uvicorn defaults to `uvloop` if available, but `uvloop` can conflict with
-CUDA/PyTorch on Jetson. Explicitly using `--loop asyncio` avoids this.
+## `gliner` Lazy-Import Patch
 
-## No `--reload` (uvicorn)
+We patch `/usr/local/lib/python3.10/dist-packages/gliner/__init__.py` during build
+so `GLiNER` is lazy-loaded from `.model` via `__getattr__`.
 
-Uvicorn's `--reload` flag forks processes to watch for file changes. Forking
-after CUDA initialization corrupts GPU state, causing `malloc()` crashes. Never
-use `--reload` with GPU models.
+Why:
+- Prevents hard import-time requirement on `onnxruntime`
+- Lets GLiNER2/PyTorch path run stably without ONNX Runtime in this container
+
+## Uvicorn / Startup Settings
+
+- Use `--loop asyncio`
+- Use `MODEL_PRELOAD=0` in Docker runs
+
+Why:
+- `MODEL_PRELOAD=0` avoids some startup allocator issues seen on Jetson
+- First request pays model-load cost; subsequent requests are faster
+
+## Concurrency Notes
+
+API endpoints run with `asyncio.to_thread(...)` so event loop remains responsive.
+
+Practical behavior:
+- Multiple requests can be accepted concurrently
+- GPU inference is still effectively serialized by model/device execution
+
+## Operational Notes
+
+- Prefer `make docker-build` for cached builds
+- Use `make docker-build-no-cache` only when necessary
+- BuildKit cache is required for wheel caching behavior
+
+## Known Working Signals
+
+When healthy, logs should show:
+- `Uvicorn running on http://0.0.0.0:8012`
+- First inference returns `200 OK`
+- `GLiNER2 loaded on GPU (Orin)`
+- No `free(): invalid pointer` / `malloc()` crashes
+
