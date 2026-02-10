@@ -13,3 +13,7 @@ accelerate
 sentencepiece
 tqdm
 pillow
+requests
+urllib3
+
+numpy<2.0.0
