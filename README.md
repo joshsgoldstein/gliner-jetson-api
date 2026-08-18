@@ -1,7 +1,11 @@
 # GLiNER2 API (Jetson)
 
-A FastAPI server for [GLiNER2](https://github.com/urchade/GLiNER) multi-task
-information extraction, built specifically for NVIDIA Jetson (JetPack 6 / L4T R36).
+A FastAPI server for [GLiNER2](https://github.com/fastino-ai/GLiNER2) multi-task
+information extraction, built specifically for NVIDIA Jetson.
+
+Built on JetPack 6 / L4T R36, and **verified running on JetPack 7 / L4T R39**
+(the image carries its own CUDA 12.6 userspace, so no rebuild is needed — see
+[JETSON.md](JETSON.md)).
 
 Supports entity extraction, text classification, structured JSON extraction,
 and combined multi-task schemas — all running on-device with GPU acceleration.
@@ -61,6 +65,35 @@ Response:
     "symptom": ["headache"],
     "time": ["2 PM"]
   }
+}
+```
+
+### Multi-task
+
+`/extract_multitask` takes a single `schema_config` object — not top-level
+`entities` / `classification` keys:
+
+```bash
+curl -X POST http://localhost:8012/extract_multitask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Apple CEO Tim Cook announced record revenue in Cupertino.",
+    "schema_config": {
+      "entities": ["company", "person", "location"],
+      "classification": {"name": "sentiment", "labels": ["positive", "negative"]},
+      "structure": {
+        "name": "announcement",
+        "fields": [{"name": "who", "dtype": "str"}, {"name": "what", "dtype": "str"}]
+      }
+    }
+  }'
+```
+
+```json
+{
+  "entities": {"company": ["Apple"], "person": ["Tim Cook"], "location": ["Cupertino"]},
+  "sentiment": "positive",
+  "announcement": [{"who": "Tim Cook", "what": "record revenue"}]
 }
 ```
 

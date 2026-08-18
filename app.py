@@ -93,6 +93,8 @@ async def health() -> Dict[str, Any]:
         "model_id": MODEL_ID,
         "model_path": LOCAL_MODEL_PATH,
         "loaded": _model is not None,
+        "device": DEVICE,
+        "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None,
         "max_concurrent_inferences": MAX_CONCURRENT_INFERENCES,
     }
 
