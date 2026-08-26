@@ -45,10 +45,15 @@ RUN test -s /app/requirements.txt
 RUN pip3 install --no-cache-dir --default-timeout=100 -r /app/requirements.txt
 
 # Install GLiNER + GLiNER2 without deps (avoids pulling x86 CPU-only torch)
-# Pinned: gliner2 1.3.2 added a `peft` dependency that --no-deps silently drops,
-# which breaks startup at import time. Bump these deliberately, not implicitly.
+# Pinned deliberately, not implicitly. Two traps live here:
+#   1. gliner2 1.3.2 added a `peft` dependency that --no-deps silently drops,
+#      producing an image that builds clean and then dies at import time.
+#   2. gliner2 2.0.0 requires transformers<5 (pinned in requirements.txt), and
+#      the mDeBERTa tokenizer used by gliner2.5-multi needs `protobuf` or it
+#      raises ImportError on load.
+# When bumping, check `pip3 show gliner2` for new Requires: entries.
 RUN pip3 install --no-cache-dir gliner==0.2.28 --no-deps \
-    && pip3 install --no-cache-dir gliner2==1.3.2 --no-deps \
+    && pip3 install --no-cache-dir gliner2==2.0.0 --no-deps \
     && pip3 uninstall -y onnxruntime onnxruntime-gpu || true
 
 # Patch gliner package to lazy-load GLiNER from .model so importing `gliner`
