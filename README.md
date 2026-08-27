@@ -101,7 +101,7 @@ curl -X POST http://localhost:8012/extract_multitask \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_ID` | `fastino/gliner2-large-v1` | HuggingFace model ID |
+| `MODEL_ID` | `fastino/gliner2.5-base-v1` | HuggingFace model ID |
 | `MODEL_DIR` | `./models` | Local model storage directory |
 | `MODEL_PRELOAD` | `1` | Set to `0` to defer model loading until first request |
 | `MAX_CONCURRENT_INFERENCES` | `1` | Maximum in-flight inference tasks across endpoints |

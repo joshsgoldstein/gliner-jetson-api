@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gliner2-server")
 
 # --- Settings ---
-MODEL_ID = os.getenv("MODEL_ID", "fastino/gliner2-large-v1")
+MODEL_ID = os.getenv("MODEL_ID", "fastino/gliner2.5-base-v1")
 MODEL_DIR = os.getenv("MODEL_DIR", "./models")
 LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, MODEL_ID)
 MODEL_PRELOAD = os.getenv("MODEL_PRELOAD", "1").lower() not in {"0", "false", "no"}
