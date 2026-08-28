@@ -38,7 +38,10 @@ MAX_TEXT_CHARS = max(1, int(os.getenv("MAX_TEXT_CHARS", "20000")))
 MAX_LABELS = max(1, int(os.getenv("MAX_LABELS", "256")))
 MAX_SCHEMA_FIELDS = max(1, int(os.getenv("MAX_SCHEMA_FIELDS", "256")))
 MAX_BATCH_SIZE = max(1, int(os.getenv("MAX_BATCH_SIZE", "64")))
-HEALTH_PROBE_TIMEOUT_SECONDS = float(os.getenv("HEALTH_PROBE_TIMEOUT_SECONDS", "30"))
+# Total characters across a batch. MAX_BATCH_SIZE alone does not bound memory:
+# 64 documents of MAX_TEXT_CHARS each is what OOMs the box.
+MAX_BATCH_CHARS = max(1, int(os.getenv("MAX_BATCH_CHARS", "200000")))
+HEALTH_PROBE_TIMEOUT_SECONDS = float(os.getenv("HEALTH_PROBE_TIMEOUT_SECONDS", "5"))
 HEALTH_PROBE_TEXT = os.getenv("HEALTH_PROBE_TEXT", "Apple is based in Cupertino.")
 
 app = FastAPI(title="GLiNER2 API (Jetson)")
@@ -46,6 +49,7 @@ _model: Any = None
 _model_arch: str | None = None
 _model_init_lock = threading.Lock()
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
+_inflight = 0
 
 
 def _ensure_model_downloaded() -> None:
@@ -131,6 +135,20 @@ def startup_event() -> None:
         _get_model()
 
 
+async def _probe_inference(timeout: float) -> Any:
+    """Run a tiny inference WITHOUT taking an inference slot.
+
+    Deliberate: with MAX_CONCURRENT_INFERENCES=1 a probe that queues behind a
+    hung request hangs too, so a wedged worker and a busy one look identical.
+    Bypassing the semaphore keeps the two distinguishable.
+    """
+    model = await asyncio.wait_for(asyncio.to_thread(_get_model), timeout=timeout)
+    return await asyncio.wait_for(
+        asyncio.to_thread(model.extract_entities, HEALTH_PROBE_TEXT, ["company"]),
+        timeout=timeout,
+    )
+
+
 @app.get("/health")
 async def health(probe: bool = False) -> Dict[str, Any]:
     """Liveness, and with ?probe=1 an actual inference.
@@ -151,24 +169,16 @@ async def health(probe: bool = False) -> Dict[str, Any]:
         "max_concurrent_inferences": MAX_CONCURRENT_INFERENCES,
     }
 
+    body["inflight"] = _inflight
+    body["saturated"] = _inflight >= MAX_CONCURRENT_INFERENCES
+
     if not probe:
         return body
 
     started = time.monotonic()
     try:
-        result = await asyncio.wait_for(
-            _run_inference(
-                "health_probe",
-                lambda model: model.extract_entities(HEALTH_PROBE_TEXT, ["company"]),
-            ),
-            timeout=HEALTH_PROBE_TIMEOUT_SECONDS,
-        )
-        body["probe"] = {
-            "ok": True,
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-            "result": result,
-        }
-    except Exception as exc:  # asyncio.TimeoutError, HTTPException, model errors
+        result = await _probe_inference(HEALTH_PROBE_TIMEOUT_SECONDS)
+    except Exception as exc:  # TimeoutError, model errors
         body["status"] = "degraded"
         body["probe"] = {
             "ok": False,
@@ -177,7 +187,18 @@ async def health(probe: bool = False) -> Dict[str, Any]:
         }
         raise HTTPException(status_code=503, detail=body)
 
+    body["probe"] = {
+        "ok": True,
+        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "result": result,
+    }
     return body
+
+
+@app.get("/health/deep")
+async def health_deep() -> Dict[str, Any]:
+    """Always probes. Equivalent to /health?probe=1; point monitoring here."""
+    return await health(probe=True)
 
 
 @app.get("/version")
@@ -374,6 +395,7 @@ async def _run_inference(op_name: str, infer_fn: Callable[["GLiNER2"], Any]) -> 
             timeout=INFERENCE_ACQUIRE_TIMEOUT_SECONDS,
         )
         acquired = True
+        globals()["_inflight"] += 1
         acquired_at = loop.time()
         queue_wait_s = acquired_at - started
     except asyncio.TimeoutError as exc:
@@ -409,6 +431,7 @@ async def _run_inference(op_name: str, infer_fn: Callable[["GLiNER2"], Any]) -> 
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         if acquired:
+            globals()["_inflight"] -= 1
             _inference_semaphore.release()
         total_s = loop.time() - started
         log.info(
@@ -635,7 +658,18 @@ def _validate_texts(texts: Any) -> list:
             status_code=413,
             detail=f"'texts' exceeds MAX_BATCH_SIZE={MAX_BATCH_SIZE}.",
         )
-    return [_validate_text(t) for t in texts]
+    validated = [_validate_text(t) for t in texts]
+
+    total_chars = sum(len(t) for t in validated)
+    if total_chars > MAX_BATCH_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"batch totals {total_chars} chars, exceeding "
+                f"MAX_BATCH_CHARS={MAX_BATCH_CHARS}. Split the batch."
+            ),
+        )
+    return validated
 
 
 @app.post("/extract_relations")
