@@ -5,11 +5,12 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 
 import torch
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from huggingface_hub import snapshot_download
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ MODEL_DIR = os.getenv("MODEL_DIR", "./models")
 LOCAL_MODEL_PATH = os.path.join(MODEL_DIR, MODEL_ID)
 MODEL_PRELOAD = os.getenv("MODEL_PRELOAD", "1").lower() not in {"0", "false", "no"}
 MAX_CONCURRENT_INFERENCES = max(1, int(os.getenv("MAX_CONCURRENT_INFERENCES", "1")))
-INFERENCE_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("INFERENCE_ACQUIRE_TIMEOUT_SECONDS", "10"))
+INFERENCE_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("INFERENCE_ACQUIRE_TIMEOUT_SECONDS", "60"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_TEXT_CHARS = max(1, int(os.getenv("MAX_TEXT_CHARS", "20000")))
 MAX_LABELS = max(1, int(os.getenv("MAX_LABELS", "256")))
@@ -40,7 +41,7 @@ MAX_SCHEMA_FIELDS = max(1, int(os.getenv("MAX_SCHEMA_FIELDS", "256")))
 MAX_BATCH_SIZE = max(1, int(os.getenv("MAX_BATCH_SIZE", "64")))
 # Total characters across a batch. MAX_BATCH_SIZE alone does not bound memory:
 # 64 documents of MAX_TEXT_CHARS each is what OOMs the box.
-MAX_BATCH_CHARS = max(1, int(os.getenv("MAX_BATCH_CHARS", "200000")))
+MAX_BATCH_CHARS = max(1, int(os.getenv("MAX_BATCH_CHARS", "40000")))
 HEALTH_PROBE_TIMEOUT_SECONDS = float(os.getenv("HEALTH_PROBE_TIMEOUT_SECONDS", "5"))
 HEALTH_PROBE_TEXT = os.getenv("HEALTH_PROBE_TEXT", "Apple is based in Cupertino.")
 
@@ -50,6 +51,113 @@ _model_arch: str | None = None
 _model_init_lock = threading.Lock()
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 _inflight = 0
+
+
+# --- OpenAPI request schemas ------------------------------------------------
+# These models exist to generate a self-describing /openapi.json. They are NOT
+# used for runtime parsing: the routes keep their dict bodies so the hand-rolled
+# validators continue to return 400 (Pydantic would return 422 and break the
+# error contract consumers depend on). Schema and runtime are kept in step by
+# the contract cases in evals/cases/contract.jsonl.
+
+class InferenceOptions(BaseModel):
+    """Optional knobs accepted by every extract/classify route."""
+    threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="Confidence floor (default 0.5). Lower = higher recall.",
+    )
+    include_confidence: Optional[bool] = Field(
+        None,
+        description="Return {text, confidence} objects instead of bare strings.",
+    )
+    include_spans: Optional[bool] = Field(
+        None,
+        description="Return {text, start, end} character offsets instead of bare strings.",
+    )
+    max_len: Optional[int] = Field(None, ge=1, description="Chunk length for long documents.")
+    overlap_policy: Optional[str] = Field(None, description="Chunk overlap policy.")
+
+
+Labels = Union[List[str], Dict[str, Any]]
+
+
+class EntitiesRequest(InferenceOptions):
+    text: str = Field(..., description="Text to extract from.")
+    labels: Labels = Field(..., description="Entity labels, or {label: description}.")
+
+
+class ClassifyRequest(InferenceOptions):
+    text: str
+    labels: Dict[str, Any] = Field(
+        ...,
+        description='Task name -> labels, e.g. {"sentiment": ["positive", "negative"]}. '
+                    'A bare list is rejected with 400.',
+    )
+
+
+class StructuredRequest(InferenceOptions):
+    text: str
+    schema_: Dict[str, Any] = Field(
+        ..., alias="schema",
+        description='Field spec, e.g. {"product": ["name::str", "price::str"]}',
+    )
+
+
+class RelationsRequest(InferenceOptions):
+    text: str
+    relations: List[str] = Field(..., description="Relation type names.")
+
+
+class SchemaConfig(BaseModel):
+    """Multi-task schema. Unknown keys are rejected with 400."""
+    entities: Optional[List[str]] = None
+    classification: Optional[Dict[str, Any]] = Field(
+        None, description='{"name": "sentiment", "labels": ["positive", "negative"]}'
+    )
+    relations: Optional[List[str]] = None
+    structure: Optional[Dict[str, Any]] = Field(
+        None, description='{"name": "...", "fields": [{"name": "...", "dtype": "str"}]}'
+    )
+
+
+class MultitaskRequest(InferenceOptions):
+    text: str
+    schema_config: SchemaConfig
+
+
+class BatchOptions(InferenceOptions):
+    batch_size: Optional[int] = Field(None, ge=1, description=f"Clamped to MAX_BATCH_SIZE.")
+
+
+class EntitiesBatchRequest(BatchOptions):
+    texts: List[str] = Field(..., description="Documents; bounded by MAX_BATCH_SIZE and MAX_BATCH_CHARS.")
+    labels: Labels
+
+
+class ClassifyBatchRequest(BatchOptions):
+    texts: List[str]
+    labels: Dict[str, Any] = Field(..., description='Task name -> labels.')
+
+
+class RelationsBatchRequest(BatchOptions):
+    texts: List[str]
+    relations: List[str]
+
+
+class MultitaskBatchRequest(BatchOptions):
+    texts: List[str]
+    schema_config: SchemaConfig
+
+
+def _openapi_body(model: type, example: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a real request schema to a route that still takes a dict body."""
+    schema = model.model_json_schema(by_alias=True)
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": schema, "example": example}},
+        }
+    }
 
 
 def _ensure_model_downloaded() -> None:
@@ -236,6 +344,27 @@ def _validate_text(text: Any) -> str:
             detail=f"'text' exceeds MAX_TEXT_CHARS={MAX_TEXT_CHARS}.",
         )
     return text
+
+
+def _validate_classification_labels(labels: Any) -> Dict[str, Any]:
+    """gliner2's classify_text takes {task_name: [label, ...]}.
+
+    A bare list used to reach the model and surface as a 500
+    ("'list' object has no attribute 'items'"). Reject it here with a message
+    that says what to send instead.
+    """
+    if isinstance(labels, list):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'labels' must be an object mapping a task name to its labels, "
+                'e.g. {"sentiment": ["positive", "negative"]}. A bare list is not accepted.'
+            ),
+        )
+    validated = _validate_labels(labels)
+    if not isinstance(validated, dict):
+        raise HTTPException(status_code=400, detail="'labels' must be an object.")
+    return validated
 
 
 def _validate_labels(labels: Any) -> Any:
@@ -444,7 +573,11 @@ async def _run_inference(op_name: str, infer_fn: Callable[["GLiNER2"], Any]) -> 
         )
 
 
-@app.post("/extract_entities")
+@app.post(
+    "/extract_entities",
+    openapi_extra=_openapi_body(EntitiesRequest, {'text': 'Apple CEO Tim Cook announced iPhone 15 in Cupertino.', 'labels': ['company', 'person', 'product', 'location']}),
+    responses={200: {"content": {"application/json": {"example": {'entities': {'company': ['Apple'], 'person': ['Tim Cook'], 'product': ['iPhone 15'], 'location': ['Cupertino']}}}}}},
+)
 async def extract_entities(
     payload: Dict[str, Any] = Body(
         ...,
@@ -475,7 +608,11 @@ async def extract_entities(
     )
 
 
-@app.post("/classify_text")
+@app.post(
+    "/classify_text",
+    openapi_extra=_openapi_body(ClassifyRequest, {'text': 'The battery life is terrible and it overheats.', 'labels': {'sentiment': ['positive', 'negative', 'neutral']}}),
+    responses={200: {"content": {"application/json": {"example": {'sentiment': 'negative'}}}}},
+)
 async def classify_text(
     payload: Dict[str, Any] = Body(
         ...,
@@ -489,14 +626,14 @@ async def classify_text(
 ):
     """
     Classify text using GLiNER2.
-    
+
     Payload:
     - text: str
-    - labels: List[str] OR Dict (complex config)
+    - labels: Dict[str, List[str]] -- task name to labels. A bare list is a 400.
     """
     _reject_unknown_keys(payload, {"text", "labels"} | INFERENCE_OPTION_KEYS)
     text = _validate_text(payload.get("text"))
-    labels = _validate_labels(payload.get("labels"))
+    labels = _validate_classification_labels(payload.get("labels"))
     opts = _inference_options(payload)
 
     log.info(f"Classifying text len={len(text)} opts={opts}")
@@ -506,7 +643,11 @@ async def classify_text(
     )
 
 
-@app.post("/extract_structured")
+@app.post(
+    "/extract_structured",
+    openapi_extra=_openapi_body(StructuredRequest, {'text': 'The Sony WH-1000XM5 cost $399 and ship in 3 days.', 'schema': {'product': ['name::str', 'price::str', 'shipping::str']}}),
+    responses={200: {"content": {"application/json": {"example": {'product': [{'name': 'Sony WH-1000XM5', 'price': '$399', 'shipping': '3 days'}]}}}}},
+)
 async def extract_structured(
     payload: Dict[str, Any] = Body(
         ...,
@@ -543,7 +684,11 @@ async def extract_structured(
     )
 
 
-@app.post("/extract_multitask")
+@app.post(
+    "/extract_multitask",
+    openapi_extra=_openapi_body(MultitaskRequest, {'text': 'Satya Nadella, CEO of Microsoft, met Sam Altman.', 'schema_config': {'entities': ['person', 'company'], 'relations': ['works_for', 'met_with']}}),
+    responses={200: {"content": {"application/json": {"example": {'entities': {'person': ['Satya Nadella', 'Sam Altman'], 'company': ['Microsoft']}, 'relation_extraction': {'works_for': [['Satya Nadella', 'Microsoft']]}}}}}},
+)
 async def extract_multitask(
     payload: Dict[str, Any] = Body(
         ...,
@@ -672,7 +817,11 @@ def _validate_texts(texts: Any) -> list:
     return validated
 
 
-@app.post("/extract_relations")
+@app.post(
+    "/extract_relations",
+    openapi_extra=_openapi_body(RelationsRequest, {'text': 'Satya Nadella, CEO of Microsoft, met Sam Altman of OpenAI.', 'relations': ['works_for', 'met_with']}),
+    responses={200: {"content": {"application/json": {"example": {'relation_extraction': {'works_for': [['Satya Nadella', 'Microsoft']], 'met_with': [['Satya Nadella', 'Sam Altman']]}}}}}},
+)
 async def extract_relations(
     payload: Dict[str, Any] = Body(
         ...,
@@ -705,7 +854,11 @@ async def extract_relations(
     )
 
 
-@app.post("/extract_entities_batch")
+@app.post(
+    "/extract_entities_batch",
+    openapi_extra=_openapi_body(EntitiesBatchRequest, {'texts': ['Apple CEO Tim Cook announced iPhone 15.', 'Satya Nadella leads Microsoft.'], 'labels': ['company', 'person']}),
+    responses={200: {"content": {"application/json": {"example": {'results': [{'entities': {'company': ['Apple'], 'person': ['Tim Cook']}}, {'entities': {'company': ['Microsoft'], 'person': ['Satya Nadella']}}]}}}}},
+)
 async def extract_entities_batch(
     payload: Dict[str, Any] = Body(
         ...,
@@ -743,7 +896,11 @@ async def extract_entities_batch(
     )
 
 
-@app.post("/classify_text_batch")
+@app.post(
+    "/classify_text_batch",
+    openapi_extra=_openapi_body(ClassifyBatchRequest, {'texts': ['The battery is terrible.', 'Works flawlessly.'], 'labels': {'sentiment': ['positive', 'negative']}}),
+    responses={200: {"content": {"application/json": {"example": {'results': [{'sentiment': 'negative'}, {'sentiment': 'positive'}]}}}}},
+)
 async def classify_text_batch(
     payload: Dict[str, Any] = Body(
         ...,
@@ -765,7 +922,7 @@ async def classify_text_batch(
     _require_boundary("classify_text_batch")
     _reject_unknown_keys(payload, {"texts", "labels", "batch_size"} | INFERENCE_OPTION_KEYS)
     texts = _validate_texts(payload.get("texts"))
-    labels = _validate_labels(payload.get("labels"))
+    labels = _validate_classification_labels(payload.get("labels"))
     opts = _inference_options(payload)
     opts.update(_batch_size(payload))
 
@@ -776,7 +933,11 @@ async def classify_text_batch(
     )
 
 
-@app.post("/extract_relations_batch")
+@app.post(
+    "/extract_relations_batch",
+    openapi_extra=_openapi_body(RelationsBatchRequest, {'texts': ['Satya Nadella of Microsoft met Sam Altman.', 'Tim Cook runs Apple.'], 'relations': ['works_for', 'met_with']}),
+    responses={200: {"content": {"application/json": {"example": {'results': [{'relation_extraction': {'works_for': [['Satya Nadella', 'Microsoft']]}}, {'relation_extraction': {'works_for': [['Tim Cook', 'Apple']]}}]}}}}},
+)
 async def extract_relations_batch(
     payload: Dict[str, Any] = Body(
         ...,
@@ -811,7 +972,11 @@ async def extract_relations_batch(
     )
 
 
-@app.post("/extract_multitask_batch")
+@app.post(
+    "/extract_multitask_batch",
+    openapi_extra=_openapi_body(MultitaskBatchRequest, {'texts': ['Apple CEO Tim Cook announced record revenue in Cupertino.'], 'schema_config': {'entities': ['company', 'person'], 'classification': {'name': 'sentiment', 'labels': ['positive', 'negative']}}}),
+    responses={200: {"content": {"application/json": {"example": {'results': [{'entities': {'company': ['Apple'], 'person': ['Tim Cook']}, 'sentiment': 'positive'}]}}}}},
+)
 async def extract_multitask_batch(
     payload: Dict[str, Any] = Body(
         ...,
