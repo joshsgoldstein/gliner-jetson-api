@@ -42,6 +42,13 @@ MAX_BATCH_SIZE = max(1, int(os.getenv("MAX_BATCH_SIZE", "64")))
 # Total characters across a batch. MAX_BATCH_SIZE alone does not bound memory:
 # 64 documents of MAX_TEXT_CHARS each is what OOMs the box.
 MAX_BATCH_CHARS = max(1, int(os.getenv("MAX_BATCH_CHARS", "40000")))
+# Structured extraction only. At the model default of 0.5 a schema of 3+ fields
+# emits a second, span-shifted duplicate record (e.g. price becomes
+# "WH-1000XM5 headphones are on sale for $399"). 0.7 suppresses it and also
+# tightens field boundaries -- measured no recall cost on invoice/job/product
+# cases, though that is three cases, not an eval. Callers can still pass their
+# own `threshold`, which always wins.
+STRUCTURED_DEFAULT_THRESHOLD = float(os.getenv("STRUCTURED_DEFAULT_THRESHOLD", "0.7"))
 HEALTH_PROBE_TIMEOUT_SECONDS = float(os.getenv("HEALTH_PROBE_TIMEOUT_SECONDS", "5"))
 HEALTH_PROBE_TEXT = os.getenv("HEALTH_PROBE_TEXT", "Apple is based in Cupertino.")
 
@@ -676,6 +683,7 @@ async def extract_structured(
     text = _validate_text(payload.get("text"))
     schema = _validate_schema(payload.get("schema"))
     opts = _inference_options(payload)
+    opts.setdefault("threshold", STRUCTURED_DEFAULT_THRESHOLD)
 
     log.info(f"Extracting structured data for text len={len(text)} opts={opts}")
     return await _run_inference(
