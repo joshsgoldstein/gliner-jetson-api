@@ -18,17 +18,21 @@ the request. There is no fine-tuning step and no per-task model. Ask for
 `["medication", "dosage", "symptom", "time"]` on one request and
 `["company", "person", "location"]` on the next, against the same loaded weights.
 
-It handles four task shapes, all through the same model:
+It handles five task shapes, all through the same model:
 
 | Task | What it does |
 |---|---|
 | Entity extraction | Zero-shot NER against a caller-supplied label set |
 | Classification | Assign a label from caller-supplied classes |
 | Structured extraction | Fill a declared record schema from free text |
+| Relation extraction | Typed `[head, tail]` pairs for caller-supplied relation names — GLiNER2.5 only |
 | Multi-task | All of the above against one text in a single forward pass |
 
-The multi-task path is the interesting one: entities, a classification, and a
-structured record come back from one pass, rather than three round trips.
+The multi-task path is the interesting one: entities, a classification,
+relations, and a structured record come back from one pass, rather than four
+round trips. Measured on this box, multi-task plus batching is a **10.7x**
+per-document speedup over three sequential single calls — 25.8 ms versus
+274.9 ms per document over 32 documents, one run on a shared box.
 
 Paper: [arXiv:2507.18546](https://arxiv.org/abs/2507.18546).
 
@@ -49,16 +53,21 @@ legacy `GLiNER2.from_pretrained()` span loader will not dispatch it. `app.py`
 reads `config.json` at load time and picks the right loader, so callers never
 see this — but it is the first thing to check when a 2.5 model misbehaves.
 
+`AutoExtractor` is the dispatcher, not the loaded class. `/health` and
+`/version` report the concrete extractor in `model_class`, which for
+`gliner2.5-base-v1` on this box is `BoundaryExtractor`. Do not assert
+`model_class == "AutoExtractor"` in a check; assert on `architecture` instead.
+
 The `gliner2` library at version 2.0.0 (released 2026-08-24) supports both
 architectures and requires `transformers<5`.
 
 GLiNER2.5 also adds **relation extraction** — given a text and a set of relation
-names, it returns typed pairs. Verified on this box with the 2.5 model:
+names, it returns typed pairs. Verified against the live service on
+`gliner2.5-base-v1`:
 
 Input text:
 
-> Satya Nadella, CEO of Microsoft, met Sam Altman of OpenAI in Seattle to
-> discuss the Azure partnership.
+> Satya Nadella, CEO of Microsoft, met Sam Altman of OpenAI in Seattle.
 
 Relations requested: `["works_for", "met_with", "located_in"]`
 
@@ -67,19 +76,44 @@ Relations requested: `["works_for", "met_with", "located_in"]`
   "relation_extraction": {
     "works_for": [["Satya Nadella", "Microsoft"]],
     "met_with": [["Satya Nadella", "Sam Altman"]],
-    "located_in": [["Sam Altman", "Seattle"], ["OpenAI", "Seattle"]]
+    "located_in": [["Sam Altman", "Seattle"]]
   }
 }
 ```
 
-Note `located_in` returning two pairs, one of which (`Sam Altman` → `Seattle`)
-is a person and one (`OpenAI` → `Seattle`) an organization. The model is
-extracting what the sentence supports, not applying a type constraint you did
-not give it.
+Note `located_in` returning a person rather than the organization you might
+expect. The model extracts what the sentence supports; it does not apply a type
+constraint you did not give it. On a second verified example
+(`"Tim Cook runs Apple from Cupertino."`), `works_for` returned
+`["Tim Cook", "Cupertino"]` — a place. **Relation output needs downstream type
+validation**; it is not checked for you.
 
-Relation extraction is exposed as `POST /extract_relations`. It requires a
-boundary checkpoint: on a span model the endpoint returns **501** naming the
-architecture actually loaded, rather than failing obscurely.
+Relation extraction reaches the API two ways: the dedicated
+`POST /extract_relations` route, and `schema_config.relations` on the multitask
+routes, which gets relations in the same forward pass as entities,
+classification, and structure.
+
+### Boundary-only capabilities
+
+Five of the twelve routes require a boundary checkpoint. On a span model they
+return **501** naming the architecture actually loaded, rather than failing
+obscurely:
+
+| Route | Why boundary-only |
+|---|---|
+| `POST /extract_relations` | Relation head is a GLiNER2.5 addition |
+| `POST /extract_entities_batch` | Batched inference APIs land with the 2.5 extractors |
+| `POST /classify_text_batch` | Same |
+| `POST /extract_relations_batch` | Both of the above |
+| `POST /extract_multitask_batch` | Same |
+
+`schema_config.relations` carries the same requirement. Everything else —
+entities, classification, structured extraction, single-document multitask,
+`/health`, `/health/deep`, `/version` — works on both architectures.
+
+This is a real constraint on model choice, not a detail: swapping `MODEL_ID`
+down to a span checkpoint silently disables the entire batch path, and batching
+is where the throughput is.
 
 ## Model family
 
@@ -101,9 +135,39 @@ Notes:
 - `gliner2.5-small-v1` at 74M is the option to reach for when the box is under
   memory pressure or latency budget is tight.
 - On-disk sizes measured here: `gliner2-large-v1` 1.9 GB,
-  `gliner2.5-multi-v1` 1.1 GB.
+  `gliner2.5-multi-v1` 1.1 GB, `gliner2.5-base-v1` 748 MB.
+- The three span/boundary checkpoints above are the ones that have actually been
+  run here. `gliner2-base-v1` and `gliner2.5-small-v1` have not been measured on
+  this box.
 
 ### Measured comparison on this hardware
+
+Three checkpoints, same six input sentences, average of 5 runs on the AGX Orin
+GPU with another LLM sharing the box:
+
+| `MODEL_ID` | Avg latency | On disk |
+|---|---|---|
+| `fastino/gliner2.5-base-v1` | 83 ms | 748 MB |
+| `fastino/gliner2.5-multi-v1` | 94 ms | 1.1 GB |
+| `fastino/gliner2-large-v1` | 109 ms | 1.9 GB |
+
+`gliner2.5-base` was fastest and smallest, which is why it is the current
+default `MODEL_ID`.
+
+Quality differences on the same run, which mattered more than the latency gap:
+
+- `gliner2.5-multi` produced **duplicate, garbled records on structured
+  extraction**. `gliner2.5-base` did not.
+- `gliner2.5-multi` **under-recalled English entities** relative to
+  `gliner2.5-base`.
+
+**Caveat: six sentences.** That is not a rigorous evaluation. It is not evidence
+that the multilingual model is worse in general, and it says nothing about its
+non-English behaviour, which is the reason to run it at all. What it does
+support is a practice: re-check outputs against your own texts before and after
+any `MODEL_ID` change.
+
+### Earlier two-model comparison
 
 Average of 5 runs on the AGX Orin GPU, with another LLM sharing the box.
 **Indicative, not a rigorous evaluation** — the box was not quiesced and the
@@ -125,6 +189,19 @@ precise ratios into these.
 Batching, same conditions, `gliner2.5-multi`, 16 identical documents: 384 ms
 batched (24.0 ms/doc) versus 1607 ms sequential (100.4 ms/doc) — a **4.2x**
 per-document speedup.
+
+Combining batching with multi-task compounds it. Over 32 documents on
+`gliner2.5-base`: three sequential single calls per document cost 274.9 ms/doc
+(218 documents/min), one `/extract_multitask_batch` call cost 25.8 ms/doc
+(2326 documents/min) — **10.7x**. One run, shared box.
+
+Two things that did *not* help, recorded so nobody re-derives them:
+
+- **Schema caching between batch calls.** 127.41 ms versus 127.42 ms over 16
+  documents. Noise.
+- **Raising concurrency.** The GPU serializes the work regardless; more
+  concurrent requests multiply peak activation memory without buying
+  throughput.
 
 Memory: `gliner2-large-v1` measured a 4.28 GiB container footprint idle and
 4.69 GiB at peak. Both models loaded into one process measured 3.11 GB of GPU
@@ -166,6 +243,31 @@ on the same box.
 
 ## Service architecture
 
+The service exposes **twelve routes**: three `GET` for health and identity, and
+nine `POST` for inference. Full reference with verified request/response pairs
+in [api.md](api.md).
+
+| Route | Shape | Boundary only |
+|---|---|---|
+| `GET /health` | Liveness, model/device state, `inflight`, `saturated` | no |
+| `GET /health/deep` | Liveness plus a real inference probe; `503` when degraded | no |
+| `GET /version` | `gliner2`, `model_id`, `model_revision`, `architecture`, `model_class`, `torch` | no |
+| `POST /extract_entities` | one text → entities | no |
+| `POST /classify_text` | one text → classification | no |
+| `POST /extract_structured` | one text → records | no |
+| `POST /extract_multitask` | one text → entities + classification + relations + structure | no |
+| `POST /extract_relations` | one text → relation pairs | **yes** |
+| `POST /extract_entities_batch` | many texts → entities | **yes** |
+| `POST /classify_text_batch` | many texts → classifications | **yes** |
+| `POST /extract_relations_batch` | many texts → relation pairs | **yes** |
+| `POST /extract_multitask_batch` | many texts, one schema → everything | **yes** |
+
+All nine `POST` routes share one set of optional inference parameters —
+`threshold`, `include_confidence`, `include_spans`, `max_len`,
+`overlap_policy`, and `batch_size` on the batch routes. `include_confidence` and
+`include_spans` change the response shape (bare strings become objects), so they
+are a per-consumer decision, not a per-call one.
+
 ```
 client (LAN)
   │  HTTP  http://192.168.1.177:8013
@@ -176,12 +278,17 @@ host jarvita-agx  ── AGX Orin 64GB, JetPack 7.2 / L4T R39.2.0, Ubuntu 24.04
   ▼
 container gliner-api  ── image built on nvcr.io/nvidia/l4t-jetpack:r36.4.0 (JetPack 6)
   │  Python 3.10, torch 2.8.0+cu126, sm_87
-  │  tini (PID 1) → uvicorn --loop asyncio → FastAPI (app.py)
-  │      ├── validation: text length, label count, schema field count
+  │  tini (PID 1) → uvicorn --loop asyncio → FastAPI (app.py) — 12 routes
+  │      ├── strict key validation: unknown payload/schema_config key → 400
+  │      ├── bounds: text length, batch count, batch chars, labels, fields
+  │      ├── inference options: threshold, include_confidence, include_spans,
+  │      │                      max_len, overlap_policy, batch_size
   │      ├── asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
-  │      └── asyncio.to_thread(...) → gliner2 model
+  │      ├── asyncio.to_thread(...) → gliner2 model
+  │      └── /health/deep probe → gliner2 model, BYPASSING the semaphore
   ▼
-model  ── GLiNER2 (span) or AutoExtractor (boundary), selected from config.json
+model  ── GLiNER2 (span) or AutoExtractor → BoundaryExtractor (boundary),
+  │  loader selected from config.json's "architecture"
   │  weights bind-mounted from /ssd/gliner/models → /app/models
   ▼
 Orin iGPU (unified memory, shared with other workloads on the box)
@@ -196,11 +303,27 @@ Design points worth knowing:
 - **Concurrency is bounded by a semaphore**, default width 1. The GPU serializes
   the work anyway; the semaphore makes that explicit and turns overload into a
   clean `503` instead of memory thrash.
-- **Everything is bounded**: text length, label count, schema field count, slot
-  acquisition, and inference duration all have limits with defined status codes.
-  See [api.md](api.md#errors).
+- **Everything is bounded**: text length, batch document count, batch character
+  total, label count, schema field count, slot acquisition, inference duration,
+  and the health probe all have limits with defined status codes. See
+  [api.md](api.md#errors). Two bounds guard batches, not one — `MAX_BATCH_SIZE`
+  counts documents and `MAX_BATCH_CHARS` counts characters, because a document
+  count alone does not bound memory and unbounded batches OOMed the box.
+- **Unknown keys fail loudly.** A key that is neither a task field nor a known
+  inference option returns `400` listing what was allowed, in the payload and
+  inside `schema_config`. These used to be ignored, which turned a typo into a
+  plausible-looking result that was quietly missing data.
+- **The deep health probe bypasses the semaphore on purpose.** With a semaphore
+  width of 1, a probe that queued behind a hung request would hang too, and a
+  wedged worker would be indistinguishable from a busy one. Bypassing it keeps
+  the two separable — measured, `/health/deep` answered in 1.56 s while a normal
+  request queued 4.08 s behind a saturating batch.
 - **Weights live on the host SSD.** Replacing the container does not
   re-download several GB.
+- **`/version` is a provenance stamp, not just a version string.** It returns
+  `model_revision`, a stable fingerprint of the weights on disk, so extracted
+  rows can record which checkpoint produced them. Without it, extractions from
+  two different models are indistinguishable once stored.
 
 ### The JetPack 6-on-JetPack 7 situation
 
