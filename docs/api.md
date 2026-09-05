@@ -798,7 +798,7 @@ Four routes take a `texts` list instead of a `text` string. All four:
   the semaphore once per document;
 - accept every [inference option](#inference-options) plus `batch_size`;
 - are bounded by both `MAX_BATCH_SIZE` (default 64 documents) and
-  `MAX_BATCH_CHARS` (default 200000 characters summed across the batch) —
+  `MAX_BATCH_CHARS` (default 40000 characters summed across the batch) —
   either overrun is a `413`.
 
 `MAX_BATCH_CHARS` exists because `MAX_BATCH_SIZE` alone does not bound memory:
@@ -1005,7 +1005,7 @@ body.
 | 400 | `batch_size` not a positive integer | `'batch_size' must be a positive integer.` |
 | 413 | `text` longer than `MAX_TEXT_CHARS` | `'text' exceeds MAX_TEXT_CHARS=20000.` |
 | 413 | `texts` longer than `MAX_BATCH_SIZE` | `'texts' exceeds MAX_BATCH_SIZE=64.` |
-| 413 | Batch character total over `MAX_BATCH_CHARS` | `batch totals 285000 chars, exceeding MAX_BATCH_CHARS=200000. Split the batch.` |
+| 413 | Batch character total over `MAX_BATCH_CHARS` | `batch totals 285000 chars, exceeding MAX_BATCH_CHARS=40000. Split the batch.` |
 | 501 | Boundary-only route called on a span model *(not reproducible on this deployment)* | `'extract_relations' requires a GLiNER2.5 boundary checkpoint; loaded model '...' has architecture 'span'. Set MODEL_ID to e.g. fastino/gliner2.5-multi-v1.` |
 | 500 | Inference raised inside the model | Exception string |
 | 503 | No inference slot free within `INFERENCE_ACQUIRE_TIMEOUT_SECONDS` | `Server is busy; no inference slot available within 10.0s.` |
@@ -1038,7 +1038,7 @@ python3 -c "import json; print(json.dumps({'texts': ['a'*19000]*15, 'labels': ['
 ```
 
 ```json
-{"detail": "batch totals 285000 chars, exceeding MAX_BATCH_CHARS=200000. Split the batch."}
+{"detail": "batch totals 285000 chars, exceeding MAX_BATCH_CHARS=40000. Split the batch."}
 ```
 
 Every limit named in a `413`/`400` detail is the **live configured value**, not
@@ -1096,7 +1096,8 @@ error semantics above.
 | `MAX_LABELS` | `256` | `400` threshold for label, relation, and class lists |
 | `MAX_SCHEMA_FIELDS` | `256` | `400` threshold for schema fields |
 | `MAX_BATCH_SIZE` | `64` | `413` threshold for `texts` length; also the ceiling `batch_size` is clamped to |
-| `MAX_BATCH_CHARS` | `200000` | `413` threshold for characters summed across a batch |
+| `STRUCTURED_DEFAULT_THRESHOLD` | `0.7` | Default `threshold` for `/extract_structured` only; an explicit `threshold` wins |
+| `MAX_BATCH_CHARS` | `40000` | `413` threshold for characters summed across a batch |
 | `HEALTH_PROBE_TIMEOUT_SECONDS` | `5` | Probe budget before `/health/deep` returns `503 degraded` |
 | `HEALTH_PROBE_TEXT` | `Apple is based in Cupertino.` | The text the probe runs against, with the fixed label `["company"]` |
 

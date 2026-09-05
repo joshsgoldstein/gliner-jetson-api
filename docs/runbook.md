@@ -274,7 +274,8 @@ There is no config file. Changing any of them means recreating the container.
 | `MAX_LABELS` | `256` | Label / relation / class list cap; `400` |
 | `MAX_SCHEMA_FIELDS` | `256` | Schema field cap; `400` |
 | `MAX_BATCH_SIZE` | `64` | Documents per batch request; `413`. Also the ceiling `batch_size` is clamped to |
-| `MAX_BATCH_CHARS` | `200000` | **Total** characters summed across a batch; `413` |
+| `STRUCTURED_DEFAULT_THRESHOLD` | `0.7` | `/extract_structured` only. At 0.5 a 3+ field schema emits a duplicate, span-shifted record |
+| `MAX_BATCH_CHARS` | `40000` | **Total** characters summed across a batch; `413` |
 | `HEALTH_PROBE_TIMEOUT_SECONDS` | `5` | Probe budget before `/health/deep` returns `503 degraded` |
 | `HEALTH_PROBE_TEXT` | `Apple is based in Cupertino.` | Text the probe runs against, with the fixed label `["company"]` |
 
@@ -286,7 +287,7 @@ There is no config file. Changing any of them means recreating the container.
 of tweets and a very large batch of contracts; the cap counts documents, and
 activation memory scales with characters. 64 documents of `MAX_TEXT_CHARS`
 (20000) each is 1.28M characters in one forward pass, and that is what OOMed
-this box. `MAX_BATCH_CHARS=200000` is the bound that actually holds — roughly
+this box. `MAX_BATCH_CHARS=40000` is the bound that actually holds — roughly
 6.4x below that worst case, or 64 documents averaging ~3100 characters.
 
 Either overrun is a `413` and neither is a crash. A batch can be well inside the
@@ -299,7 +300,7 @@ python3 -c "import json; print(json.dumps({'texts': ['a'*19000]*15, 'labels': ['
 ```
 
 ```json
-{"detail":"batch totals 285000 chars, exceeding MAX_BATCH_CHARS=200000. Split the batch."}
+{"detail":"batch totals 285000 chars, exceeding MAX_BATCH_CHARS=40000. Split the batch."}
 ```
 
 The number in that message is the **live configured value**, not the table

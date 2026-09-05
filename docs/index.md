@@ -61,3 +61,12 @@ answering, so `curl -f` against it is a complete readiness check. Plain
   distinguishable from a merely busy one.
 - **Platform:** a JetPack 6 image running on a JetPack 7 host, on purpose. Read
   [../JETSON.md](../JETSON.md) before changing the build.
+
+## Learning path
+
+New to this service? Work through [`notebooks/`](notebooks/README.md) — seven
+progressive notebooks from first call to running it in production. Start with
+[01-getting-started](notebooks/01-getting-started.ipynb).
+
+The older single-file [`examples.ipynb`](examples.ipynb) is kept as a terse
+reference covering the same ground in one pass.
