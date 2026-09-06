@@ -7,7 +7,7 @@ from huggingface_hub import snapshot_download
 
 load_dotenv()
 
-model_id = os.getenv("MODEL_ID", "fastino/gliner2-large-v1")
+model_id = os.getenv("MODEL_ID", "fastino/gliner2.5-base-v1")
 local_model_path = os.path.join("./models", model_id)
 
 os.makedirs(local_model_path, exist_ok=True)

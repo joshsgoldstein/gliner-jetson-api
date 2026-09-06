@@ -131,3 +131,82 @@ When healthy, logs should show:
 - `GLiNER2 loaded on GPU (Orin)`
 - No `free(): invalid pointer` / `malloc()` crashes
 
+
+
+## JetPack 7 (L4T r39) Compatibility
+
+**This JetPack 6 image runs unmodified on a JetPack 7 host. Do not "port" it.**
+
+Verified on `jarvita-agx` (L4T **R39.2.0**, JetPack 7.2, Ubuntu 24.04, driver
+default runtime `nvidia`):
+
+```
+torch 2.8.0 | cuda 12.6 | arch_list ['sm_87'] | is_available True | Orin
+GLiNER2 loaded on GPU (Orin)
+```
+
+The container ships its own CUDA 12.6 userspace; the newer JP7 driver on the host
+is forward-compatible with it. Nothing in the image needs to match the host's
+CUDA 13.
+
+### Do NOT switch to the `sbsa/cu130` wheel index
+
+This is the trap. When JetPack 7 landed, `pypi.jetson-ai-lab.io` had **no `jp7`
+index** — only `jp6/{cu126,cu128,cu129}` and `sbsa/cu130`. `sbsa/cu130` looks like
+the obvious JP7 successor: it has CUDA 13 `cp312` aarch64 wheels matching JP7's
+Python 3.12. It is the wrong index.
+
+`sbsa` = Server Base System Architecture — Grace Hopper / Grace Blackwell. Those
+wheels are compiled for **sm_90 / sm_100**, not Orin's **sm_87**. Torch imports
+fine, `torch.cuda.is_available()` returns `True`, and it even prints
+`device: Orin` — then the first real kernel launch dies with:
+
+```
+CUDA error: no kernel image is available for execution on the device
+```
+
+Getting that far also requires chasing undeclared system deps the sbsa build
+needs and the CUDA base image lacks — for the record, so nobody re-derives them:
+
+- `libnvpl-lapack0`, `libnvpl-blas0` — sbsa torch links NVPL, not OpenBLAS
+- `cuda-cupti-13-0`
+- `libcudss0-cuda-13` — and it installs to
+  `/usr/lib/aarch64-linux-gnu/libcudss/13/`, which is **not** on the linker path;
+  needs an `/etc/ld.so.conf.d` entry + `ldconfig`
+- `libnuma1`
+
+All of that work still ends at `cudaErrorNoKernelImageForDevice`. It is a dead
+end for Orin.
+
+### Also note
+
+- There is **no `nvcr.io/nvidia/l4t-jetpack:r39.*` tag** — NVIDIA did not ship an
+  L4T JetPack base image for r39. `r36.4.0` remains the base here.
+- If you ever do need a JP7-native rebuild, the wheels must come from a Jetson
+  index that publishes **sm_87** builds. Check for a `jp7` index appearing on
+  `pypi.jetson-ai-lab.io` before assuming `sbsa` will work.
+- Pip against a devpi index needs the `+simple/` path
+  (`https://pypi.jetson-ai-lab.io/sbsa/cu130/+simple/`). Without it pip silently
+  falls back to PyPI and installs a **CPU-only** wheel that reports `2.9.1+cpu`.
+
+
+## Why gliner / gliner2 are version-pinned
+
+They are installed with `--no-deps` (to stop pip resolving an x86 CPU-only torch
+over the Jetson CUDA wheel). The cost of `--no-deps` is that **new upstream
+dependencies are silently dropped** — the build succeeds and the failure only
+shows up at container startup.
+
+This already happened once: `gliner2` 1.2.4 → **1.3.2** added a `peft`
+dependency. An unpinned rebuild produced an image that built cleanly and then
+died on boot with:
+
+```
+ModuleNotFoundError: No module named 'peft'
+```
+
+So: `gliner` and `gliner2` are pinned in the Dockerfile, and their runtime deps
+(`peft`, `accelerate`, `transformers`, …) are listed explicitly in
+`requirements.txt`. When bumping either pin, check the new release's `Requires:`
+list (`pip3 show gliner2`) and add anything new to `requirements.txt` in the same
+commit.

@@ -7,9 +7,11 @@ python-dotenv
 python-multipart
 
 # ML / HuggingFace
-transformers>=4.57.3
+transformers>=4.57.3,<5  # gliner2 2.0.0 requires <5
 huggingface_hub>=0.21.4
 accelerate
+peft
+protobuf  # required by the mDeBERTa tokenizer in gliner2.5-multi
 sentencepiece
 tqdm
 pillow

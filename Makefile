@@ -1,4 +1,4 @@
-.PHONY: help venv install install-full run run-no-preload dev docker-build docker-build-no-cache docker-run docker-run-bg docker-logs docker-stop docker-cudnn
+.PHONY: help venv install run run-no-preload dev docker-build docker-build-no-cache docker-run docker-run-bg docker-logs docker-stop docker-cudnn
 
 VENV_DIR ?= .venv
 PYTHON ?= $(VENV_DIR)/bin/python
@@ -6,11 +6,11 @@ HOST ?= 0.0.0.0
 PORT ?= 8125
 LOOP ?= asyncio
 WORKERS ?= 1
-MODEL_ID ?= fastino/gliner2-large-v1
+MODEL_ID ?= fastino/gliner2.5-base-v1
 IMAGE_NAME ?= joshsgoldstein/gliner-api
 IMAGE_TAG ?= $(IMAGE_NAME):latest
 DOCKER_PORT ?= 8012
-DOCKER_CONTEXT ?= ..
+DOCKER_CONTEXT ?= .
 DOCKER_WORKERS ?= 1
 MAX_CONCURRENT_INFERENCES ?= 1
 TORCH_WHL_URL ?= https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl
@@ -20,7 +20,6 @@ help:
 	@echo "Targets:"
 	@echo "  venv           Create venv and upgrade pip tooling"
 	@echo "  install        Install API requirements into the venv"
-	@echo "  install-full   Jetson local install via scripts/setup_venv.sh (with wheel cache)"
 	@echo "  run            Start API with model preload"
 	@echo "  run-no-preload Start API without model preload"
 	@echo "                 (set WORKERS=N for multi-process workers)"
@@ -40,10 +39,6 @@ venv:
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt
-
-install-full:
-	VENV_DIR="$(VENV_DIR)" TORCH_WHL_URL="$(TORCH_WHL_URL)" WHEEL_CACHE_DIR="$(WHEEL_CACHE_DIR)" \
-		bash scripts/setup_venv.sh
 
 run:
 	MODEL_ID=$(MODEL_ID) $(PYTHON) -m uvicorn app:app --host $(HOST) --port $(PORT) --loop $(LOOP) --workers $(WORKERS)
