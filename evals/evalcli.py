@@ -53,6 +53,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SUITE = os.path.join(HERE, "cases", "*.jsonl")
 RESULTS = os.path.join(HERE, "results.jsonl")
 DEFAULT_BASE_URL = os.environ.get("GLINER_BASE_URL", "http://192.168.1.177:8013")
+# A crashed worker is back in ~20s (model reload); wait past that before retrying.
+TRANSPORT_RETRY_WAIT = float(os.environ.get("GLINER_TRANSPORT_RETRY_WAIT", "30"))
 
 
 # --------------------------------------------------------------------------- io
@@ -98,9 +100,16 @@ def post(base_url, endpoint, payload, timeout=120):
         body = exc.read().decode("utf-8", errors="replace")
         elapsed = (time.monotonic() - start) * 1000
         return exc.code, _maybe_json(body), elapsed
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except Exception as exc:
+        # Deliberately broad. The service can die mid-run -- the process crashes
+        # and Docker restarts it ~20s later -- which surfaces as
+        # RemoteDisconnected, ConnectionResetError, ConnectionRefusedError or a
+        # bare URLError depending on exactly when the socket dropped. Catching
+        # only URLError/TimeoutError meant a crash killed the CLI with a
+        # traceback instead of being recorded, which is precisely the event
+        # worth recording. Status 0 marks a transport failure.
         elapsed = (time.monotonic() - start) * 1000
-        return 0, {"_transport_error": str(exc)}, elapsed
+        return 0, {"_transport_error": f"{type(exc).__name__}: {exc}"}, elapsed
 
 
 def _maybe_json(text):
@@ -243,10 +252,19 @@ def cmd_run(args):
     print(f"cases   : {len(cases)}  repeat={args.repeat}\n")
 
     rows, failures = [], 0
+    transport_failures = []
     for case in cases:
         latencies, passed, detail = [], False, ""
         for _ in range(args.repeat):
             status, resp, ms = post(args.base_url, case["endpoint"], case["payload"])
+            if status == 0:
+                # Transport failure: the service may be restarting. Record it,
+                # wait out a model reload, and give the case one more chance.
+                transport_failures.append({"id": case["id"], "error": resp.get("_transport_error")})
+                log_line = resp.get("_transport_error")
+                print(f"  [WARN] {case['id']:<26} transport failure: {log_line}; retrying in {TRANSPORT_RETRY_WAIT}s")
+                time.sleep(TRANSPORT_RETRY_WAIT)
+                status, resp, ms = post(args.base_url, case["endpoint"], case["payload"])
             latencies.append(ms)
         passed, detail = run_check(case["check"], status, resp)
         if not passed:
@@ -263,6 +281,12 @@ def cmd_run(args):
     passed_n = total - failures
     med_all = statistics.median([r["median_ms"] for r in rows])
     print(f"\n{passed_n}/{total} passed  |  median latency {med_all:.1f}ms")
+    if transport_failures:
+        print(f"\n  !! {len(transport_failures)} transport failure(s) -- the service dropped "
+              f"connections mid-run. This is the signature of the process crashing and "
+              f"being restarted, not a slow request:")
+        for tf in transport_failures:
+            print(f"     {tf['id']}: {tf['error']}")
 
     record = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -270,6 +294,7 @@ def cmd_run(args):
         "architecture": arch, "suite": args.suite,
         "passed": passed_n, "total": total, "median_ms": round(med_all, 1),
         "failures": [r["id"] for r in rows if not r["passed"]],
+        "transport_failures": transport_failures,
         "cases": rows,
     }
     os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
@@ -308,6 +333,9 @@ def cmd_summary(args):
     for run in runs:
         score = f"{run['passed']}/{run['total']}"
         fails = ",".join(run.get("failures", [])) or "-"
+        tf = run.get("transport_failures") or []
+        if tf:
+            fails = f"{fails}  [+{len(tf)} transport]"
         print(f"{run['ts'][:19]:<20} {str(run.get('label'))[:27]:<28} {score:>8} "
               f"{run['median_ms']:>8.1f}ms   {fails}")
     if args.full:
